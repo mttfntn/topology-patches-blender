@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+
+id = "topology_patches"
+version = "1.4.1"
+name = "Topology Patches"
+tagline = "Replace faces with the active mesh, stretched to fit and welded"
+maintainer = "Matteo Fontana"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Mesh", "Modeling"]
