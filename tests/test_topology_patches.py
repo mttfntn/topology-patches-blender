@@ -376,7 +376,7 @@ class TestCarryOver(Case):
     def test_materials_edges_and_uvs(self):
         self.target.data.materials.append(bpy.data.materials.new("TP_outer"))
         patch = fx.decorated_patch()
-        expect_uv = {'AUTO': 8, 'STICKER': 66, 'TARGET': 0}
+        expect_uv = {'AUTO': 8, 'PATCH': 66, 'TARGET': 0}
         for mode, n_uv in expect_uv.items():
             with self.subTest(uv=mode):
                 s = self.session(patch, uv_source=mode)

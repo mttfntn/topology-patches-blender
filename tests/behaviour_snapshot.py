@@ -120,7 +120,7 @@ def stamps(patch_ob, target):
     out = {}
     d = SPOTS[0]
     c = target.matrix_world.translation
-    for uv_source in ('AUTO', 'STICKER', 'TARGET'):
+    for uv_source in ('AUTO', 'PATCH', 'TARGET'):
         for shrinkwrap in (False, True):
             for rot in (0, 1):
                 key = f"uv={uv_source} shrinkwrap={shrinkwrap} rot={rot}"
