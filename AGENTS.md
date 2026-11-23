@@ -84,4 +84,4 @@ constants + `_pref` → geometry helpers (`_corner_indices`, `_newell`, `_wachsp
 - **Remote:** `origin https://github.com/mttfntn/topology-patches-blender.git` (HTTPS). Default branch `main`.
 - **Ignored:** `*.blend*`, `dist/`, `*.zip`, `__pycache__/`, `*.pyc`. `.gitattributes`: LF everywhere, zips / blends / pngs binary.
 - **CI:** `tests.yml` on pushes to `main`, pull requests, manual runs, and when called by `release.yml`. No artifacts are stored (the account's artifact quota is shared). The Blender download is cached by version and checksum.
-- **Tag `v1.4.1`** points to the commit before the test suite and has no release; releases start at `v1.5.0`.
+- **Releases start at `v1.5.0`.** Earlier versions (1.0 to 1.4.1) were never released on GitHub.
