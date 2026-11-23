@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: User guide and troubleshooting
+    url: https://github.com/mttfntn/topology-patches-blender#contents
+    about: How to make a patch, use the tool and its options, and fixes for common problems.
+  - name: Report a security problem privately
+    url: https://github.com/mttfntn/topology-patches-blender/security/advisories/new
+    about: Please do not open a public issue for security problems.
