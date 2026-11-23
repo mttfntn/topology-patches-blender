@@ -1,0 +1,89 @@
+name: release
+
+# Pushing a version tag (vX.Y.Z) runs the tests, builds the package and
+# publishes a GitHub release with the zip attached. The release notes are the
+# tag's message, so create the tag with:  git tag -a v1.2.3 -m "notes..."
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  BLENDER_VERSION: "5.3.0"
+  BLENDER_SHA256: "dacb8264197a3f7fda6001285a5a506fc97ee943881261c2c3bd63c882f22e05"
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # actions/checkout checks out the tagged commit but does not keep the
+      # annotated tag object, which holds the release notes: fetch it explicitly.
+      - name: Fetch the tag itself
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
+      - name: Check the tag matches the manifest version
+        run: |
+          manifest=$(sed -n 's/^version = "\(.*\)"/\1/p' topology_patches/blender_manifest.toml)
+          test "v${manifest}" = "${GITHUB_REF_NAME}" \
+            || { echo "::error::tag ${GITHUB_REF_NAME} but manifest version ${manifest}"; exit 1; }
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > notes.md
+          test -s notes.md || { echo "::error::the tag has no message: use git tag -a"; exit 1; }
+          cat notes.md
+
+      - id: blender
+        uses: ./.github/actions/setup-blender
+        with:
+          version: ${{ env.BLENDER_VERSION }}
+          sha256: ${{ env.BLENDER_SHA256 }}
+
+      - name: Build the package
+        run: |
+          mkdir -p dist
+          "${{ steps.blender.outputs.blender }}" -b --factory-startup \
+            --command extension build --source-dir topology_patches --output-dir dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip \
+            --title "Topology Patches ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag
+
+      # Data for the README's "download size" badge (shields.io endpoint format;
+      # shields.io can't read release files). It lives on main as
+      # .github/release-size.json and is updated here, as one bot commit on main,
+      # after each release. Pushes made with GITHUB_TOKEN start no new CI run.
+      - name: Update the download-size badge data on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          zip=$(ls dist/*.zip | head -n 1)
+          work=$(mktemp -d)
+          git clone -q --depth 1 --branch main "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$work"
+          python3 - "$zip" "$work/.github/release-size.json" <<'PY'
+          import json, os, sys
+          size = os.path.getsize(sys.argv[1])
+          text = f"{size / 1024:.1f} KB" if size < 1024 ** 2 else f"{size / 1024 ** 2:.1f} MB"
+          with open(sys.argv[2], "w") as f:
+              json.dump({"schemaVersion": 1, "label": "download size", "message": text, "color": "blue"}, f)
+              f.write("\n")
+          print(text)
+          PY
+          cd "$work"
+          git add .github/release-size.json
+          if git diff --cached --quiet; then echo "Size unchanged: nothing to commit"; exit 0; fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Download-size badge data for ${GITHUB_REF_NAME} [skip ci]"
+          git push -q origin HEAD:main

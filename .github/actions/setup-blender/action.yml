@@ -1,0 +1,78 @@
+name: Set up Blender
+description: >
+  Download a pinned Blender for Linux (official server first, then official
+  mirrors, with retries), verify its SHA-256, cache it and extract it.
+  Outputs the path of the blender executable.
+
+inputs:
+  version:
+    description: Blender version, e.g. 5.3.0
+    required: true
+  sha256:
+    description: SHA-256 of blender-<version>-linux-x64.tar.xz (from the official .sha256 file)
+    required: true
+
+outputs:
+  blender:
+    description: Path of the blender executable
+    value: ${{ steps.extract.outputs.blender }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install libraries Blender needs in background mode
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends \
+          libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libgl1 libegl1 xz-utils > /dev/null
+
+    - name: Restore cached download
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/blender-download
+        key: blender-${{ inputs.version }}-linux-x64-${{ inputs.sha256 }}
+
+    - name: Download Blender ${{ inputs.version }}
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -uo pipefail
+        file="blender-${VERSION}-linux-x64.tar.xz"
+        dir="Blender${VERSION%.*}"
+        mkdir -p ~/blender-download
+        for base in \
+            https://download.blender.org/release \
+            https://mirrors.ocf.berkeley.edu/blender/release \
+            https://ftp.nluug.nl/pub/graphics/blender/release \
+            https://mirror.clarkson.edu/blender/release \
+            https://ftp.halifax.rwth-aachen.de/blender/release; do
+          echo "::group::$base"
+          if curl -fL --retry 4 --retry-delay 15 --retry-all-errors --connect-timeout 30 \
+                  -o ~/blender-download/"$file".part "$base/$dir/$file"; then
+            mv ~/blender-download/"$file".part ~/blender-download/"$file"
+            echo "::endgroup::"
+            break
+          fi
+          echo "::endgroup::"
+          echo "::warning::download from $base failed, trying the next mirror"
+        done
+        test -f ~/blender-download/"$file" || { echo "::error::all mirrors failed"; exit 1; }
+
+    - name: Verify checksum and extract
+      id: extract
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        SHA256: ${{ inputs.sha256 }}
+      run: |
+        set -euo pipefail
+        file="blender-${VERSION}-linux-x64.tar.xz"
+        echo "${SHA256}  $HOME/blender-download/$file" | sha256sum -c -
+        mkdir -p "$RUNNER_TEMP/blender"
+        tar -xf "$HOME/blender-download/$file" -C "$RUNNER_TEMP/blender" --strip-components=1
+        "$RUNNER_TEMP/blender/blender" --version | head -1
+        echo "blender=$RUNNER_TEMP/blender/blender" >> "$GITHUB_OUTPUT"

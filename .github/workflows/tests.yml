@@ -1,0 +1,54 @@
+name: tests
+
+# Runs the test suite on the only supported Blender version, from source and
+# from the built package. Also called by the release workflow.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Supported version (keep in step with blender_manifest.toml) and the SHA-256
+  # of blender-5.3.0-linux-x64.tar.xz from download.blender.org/release/Blender5.3/blender-5.3.0.sha256
+  BLENDER_VERSION: "5.3.0"
+  BLENDER_SHA256: "dacb8264197a3f7fda6001285a5a506fc97ee943881261c2c3bd63c882f22e05"
+
+jobs:
+  test:
+    name: Blender 5.3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: blender
+        uses: ./.github/actions/setup-blender
+        with:
+          version: ${{ env.BLENDER_VERSION }}
+          sha256: ${{ env.BLENDER_SHA256 }}
+
+      - name: Check the package files
+        run: |
+          cmp LICENSE topology_patches/LICENSE
+          "${{ steps.blender.outputs.blender }}" -b --factory-startup --command extension validate topology_patches
+
+      - name: Tests (from source)
+        run: python3 tests/run.py --blender "${{ steps.blender.outputs.blender }}"
+
+      - name: Build the package
+        run: |
+          mkdir -p dist
+          "${{ steps.blender.outputs.blender }}" -b --factory-startup \
+            --command extension build --source-dir topology_patches --output-dir dist
+          ls -l dist
+
+      - name: Tests (installed package)
+        run: python3 tests/run.py --blender "${{ steps.blender.outputs.blender }}" --installed dist/*.zip
+
+      # No artifact upload: the release publishes the zip as a release asset, and
+      # artifacts count against the account's shared Actions storage quota.
