@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Matteo Fontana
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Topology Patches
 ================
 
@@ -95,13 +98,46 @@ On:  every patch vertex is laid onto the original surface of the block it
      so the patch bends with the mesh.
 Off: only the border follows the mesh; the inside is a smooth membrane
      stretched between the border vertices with a single depth direction.
+
+How the code fits together (Blender 5.3 extension, single module)
+-----------------------------------------------------------------
+Sections, in order:
+
+  geometry helpers   corner detection, Newell normal, Wachspress / mean value
+                     coordinates, grid parameters
+  Patch              analyses the patch mesh once: its border loop, corners,
+                     sides, the A x B grid (or round border), every vertex as
+                     weights over the border corners + a height, rigid islands,
+                     and the data a stamp carries over (materials, UVs, edges)
+  Target             a bmesh copy of one target object plus a BVH for ray
+                     casts.  plan() describes a stamp without touching the mesh
+                     (which faces, where every patch vertex lands); commit()
+                     opens the hole, welds the border and builds the faces;
+                     snapshot() / restore() are the in-tool undo; the
+                     shrinkwrap setup lives here too
+  Session            everything the tool does, without any UI: hover, rotate,
+                     depth, curve, rigid, apply, undo, replay, and the GPU
+                     preview.  Tests and scripts drive the add-on through it
+  operator           OBJECT_OT_topology_patches: the modal tool (mouse and
+                     keys) around a Session; it records every stamp so that
+                     execute() can replay them for Adjust Last Operation
+  UI / registration  scene settings, add-on preferences (preview colours),
+                     sidebar panel, Object menu entry
+
+Data flow of one stamp: Session.pick (ray cast) -> Target.plan (Patch.map_grid
+or Patch.map_points) -> preview batches -> Session.apply -> Target.snapshot ->
+prepare_shrinkwrap / prepare_data -> Target.commit -> mesh written back.
+
+Names kept for files made with earlier versions: a "Sticker Shrinkwrap"
+modifier and "<name>_sticker_ref" copies are still recognised and reused.
 """
 
+# Only used if the add-on is installed the legacy way; extensions read blender_manifest.toml.
 bl_info = {
     "name": "Topology Patches",
-    "author": "",
-    "version": (1, 4, 1),
-    "blender": (4, 2, 0),
+    "author": "Matteo Fontana",
+    "version": (1, 5, 0),
+    "blender": (5, 3, 0),
     "location": "View3D > Object > Topology Patches  |  Sidebar > Patches",
     "description": "Replace faces with the active mesh, stretched to fit and welded",
     "category": "Mesh",
@@ -119,9 +155,11 @@ from mathutils.bvhtree import BVHTree
 
 CORNER_ANGLE = math.radians(1.0)   # border turns sharper than this are corners
 PARAM_TOL = 1e-4                   # two border params closer than this are the same vertex
-SHRINKWRAP_NAME = "Patch Shrinkwrap"
-OLD_SHRINKWRAP_NAME = "Sticker Shrinkwrap"     # made by earlier versions: still recognised
-ADDON_ID = __package__ or __name__
+SHRINKWRAP_NAME = "Patch Shrinkwrap"           # modifier added by the shrinkwrap option
+REF_SUFFIX = "_patch_ref"                       # hidden copy of the original target
+OLD_SHRINKWRAP_NAME = "Sticker Shrinkwrap"     # made by versions before 1.4: still recognised
+OLD_REF_SUFFIX = "_sticker_ref"
+ADDON_ID = __package__ or __name__             # key of the add-on preferences
 
 # preview colours / widths; the add-on preferences override them
 DEFAULTS = {
@@ -136,14 +174,14 @@ DEFAULTS = {
 
 
 def _pref(name):
+    """A preview colour or width from the add-on preferences (DEFAULTS when
+    the preferences are not available, e.g. in tests)."""
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     prefs = addon.preferences if addon else None
     value = getattr(prefs, name, None) if prefs else None
     if value is None:
         return DEFAULTS[name]
     return value if isinstance(value, float) else tuple(value)
-REF_SUFFIX = "_patch_ref"
-OLD_REF_SUFFIX = "_sticker_ref"
 
 
 # --------------------------------------------------------------------------
@@ -173,6 +211,7 @@ def _newell(points):
 
 
 def _tri_area_2d(a, b, c):
+    """Signed area of a 2D triangle (positive when a, b, c turn counter-clockwise)."""
     return 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
 
 
@@ -237,15 +276,15 @@ def _to_grid(u, ts):
 
 
 # --------------------------------------------------------------------------
-# sticker (source mesh) analysis
+# patch (source mesh) analysis
 # --------------------------------------------------------------------------
 
-class StickerError(Exception):
-    pass
+class PatchError(Exception):
+    """A patch that cannot be used, or a tool that cannot start; the message is shown to the user."""
 
 
-class Sticker:
-    """Pre-computed description of the sticker mesh, independent of any target.
+class Patch:
+    """Pre-computed description of the patch mesh, independent of any target.
 
     Every vertex is stored as weights over the K border corners plus a signed
     height above the border plane.  When the border is a regular A x B frame,
@@ -341,7 +380,7 @@ class Sticker:
 
     def _apply_rigid(self, out, foot, depth):
         """Blend the rigid islands back to their original proportions.
-        `foot(x, y)` is the stretched position of a point of the sticker's
+        `foot(x, y)` is the stretched position of a point of the patch's
         border plane; around each island's centre it is replaced by its best
         similarity (move + rotate + uniform scale), so circles stay circles."""
         for isl in self.rigid:
@@ -369,12 +408,14 @@ class Sticker:
                 out[vi] = out[vi].lerp(rp, min(w, 1.0))
 
     def _analyse(self, bm, mw):
+        """Find the border loop, its corners and sides, and express every vertex
+        as border-corner weights + height; detect an A x B grid or a round border."""
         if not bm.faces:
-            raise StickerError("The patch has no faces")
+            raise PatchError("The patch has no faces")
         if any(not e.is_manifold and not e.is_boundary and not e.is_wire for e in bm.edges):
-            raise StickerError("The patch has non-manifold edges")
+            raise PatchError("The patch has non-manifold edges")
 
-        # --- border loop, ordered along the winding of the sticker faces
+        # --- border loop, ordered along the winding of the patch faces
         nxt = {}
         n_boundary = 0
         for e in bm.edges:
@@ -384,23 +425,23 @@ class Sticker:
             loop = e.link_loops[0]
             a, b = loop.vert.index, loop.link_loop_next.vert.index
             if a in nxt:
-                raise StickerError("The patch border touches itself")
+                raise PatchError("The patch border touches itself")
             nxt[a] = b
         if not nxt:
-            raise StickerError("The patch is closed: it needs one open border")
+            raise PatchError("The patch is closed: it needs one open border")
         start = next(iter(nxt))
         order = [start]
         while True:
             v = nxt.get(order[-1])
             if v is None:
-                raise StickerError("The patch border is not a closed loop (flipped normals?)")
+                raise PatchError("The patch border is not a closed loop (flipped normals?)")
             if v == start:
                 break
             order.append(v)
             if len(order) > n_boundary:
-                raise StickerError("The patch border is not a simple loop")
+                raise PatchError("The patch border is not a simple loop")
         if len(order) != n_boundary:
-            raise StickerError("The patch must have exactly one open border loop")
+            raise PatchError("The patch must have exactly one open border loop")
 
         co = [mw @ v.co for v in bm.verts]
         border = [co[i] for i in order]
@@ -418,7 +459,7 @@ class Sticker:
         normal = _newell(corner_pts)
         self.area = normal.length * 0.5
         if self.area < 1e-12:
-            raise StickerError("The patch border has no area")
+            raise PatchError("The patch border has no area")
         normal.normalize()
         origin = sum(corner_pts, Vector((0.0, 0.0, 0.0))) / k
         axis_u = corner_pts[1] - corner_pts[0]
@@ -583,6 +624,7 @@ class Sticker:
 
     @property
     def label(self):
+        """Short description shown in the tool's header, e.g. "2 x 2 faces"."""
         if self.round:
             return "round border, %d x %d faces" % self.grid
         if self.grid:
@@ -592,8 +634,8 @@ class Sticker:
     # -- single face mapping -------------------------------------------------
 
     def map_points(self, corners, normals, rot, depth, rigid=False):
-        """World position of every sticker vertex for a target face whose K
-        corner positions / normals are given.  Sticker corner i lands on
+        """World position of every patch vertex for a target face whose K
+        corner positions / normals are given.  Patch corner i lands on
         target corner (i + rot) % K."""
         k = self.corner_count
         pts = [corners[(i + rot) % k] for i in range(k)]
@@ -623,7 +665,7 @@ class Sticker:
     # -- A x B patch mapping -------------------------------------------------
 
     def map_grid(self, P, N, depth, curve, rigid=False, shift=0):
-        """World position of every sticker vertex for a patch whose
+        """World position of every patch vertex for a block whose
         (A+1) x (B+1) vertex positions P[i][j] and normals N[i][j] are given."""
         a, b = self.grid
         grid_border, grid_uv, grid_of = self.frame(shift)
@@ -687,11 +729,11 @@ def _grid_step(loop, direction):
         e = loop
     r = e.link_loop_radial_next
     if r is e or len(e.edge.link_faces) != 2:
-        raise StickerError("the patch runs off the mesh")
+        raise PatchError("the patch runs off the mesh")
     if len(r.face.loops) != 4:
-        raise StickerError("the patch needs quads only")
+        raise PatchError("the patch needs quads only")
     if r.vert is e.vert:
-        raise StickerError("inconsistent normals")
+        raise PatchError("inconsistent normals")
     if direction == '+u':
         return r.link_loop_next
     if direction == '+v':
@@ -702,6 +744,10 @@ def _grid_step(loop, direction):
 
 
 class Target:
+    """One target object while the tool runs: a bmesh copy of its mesh, a BVH
+    for ray casts, and the snapshots for the in-tool undo.  Every change is
+    made on the bmesh and written back to the object at once (_write)."""
+
     def __init__(self, obj):
         self.name = obj.name
         self.bm = bmesh.new()
@@ -712,11 +758,12 @@ class Target:
         self.group_index = None      # index of the "base" group once shrinkwrap is set up
         self.shrink_level = None     # history length from which the shrinkwrap setup exists
         self.shrink_made = None      # (modifier, copy, vertex group) names this session created
-        self.mat_index = {}          # sticker material name -> slot on this target
+        self.mat_index = {}          # patch material name -> slot on this target
         self.history = []            # mesh snapshots, one per stamp, for Ctrl+Z in the tool
         self.refresh()
 
     def refresh(self):
+        """Rebuild normals, lookup tables and the BVH after the bmesh changed."""
         self.bm.normal_update()
         self.bm.verts.ensure_lookup_table()
         self.bm.edges.ensure_lookup_table()
@@ -732,6 +779,7 @@ class Target:
         self.bm.free()
 
     def snapshot(self):
+        """Keep a copy of the mesh before a stamp (in-tool undo)."""
         self.history.append(self.bm.copy())
 
     def restore(self):
@@ -767,6 +815,7 @@ class Target:
             obj.vertex_groups.remove(vg)
 
     def _write(self):
+        """Write the bmesh back to the object's mesh."""
         obj = bpy.data.objects[self.name]
         self.bm.to_mesh(obj.data)
         obj.data.update()
@@ -794,7 +843,7 @@ class Target:
         """Keep the original shape around: hide a copy of the object and
         shrinkwrap this one onto it, limited to the vertex group `group`.
         Existing vertices join the group (when it is new) so that only the
-        sticker vertices outside the group are free to leave the surface."""
+        patch vertices outside the group are free to leave the surface."""
         if self.group_index is not None:
             return
         obj = bpy.data.objects[self.name]
@@ -839,22 +888,22 @@ class Target:
         self.shrink_made = (made_mod, made_ref, vg.name if fresh else None)
         self.refresh()
 
-    def prepare_data(self, sticker, uv_source):
-        """Make room on the target for what the sticker brings: attribute
+    def prepare_data(self, patch, uv_source):
+        """Make room on the target for what the patch brings: attribute
         layers, UV maps and material slots."""
         bm = self.bm
-        if any(d[2] for d in sticker.edge_data.values()) and not bm.edges.layers.float.get("crease_edge"):
+        if any(d[2] for d in patch.edge_data.values()) and not bm.edges.layers.float.get("crease_edge"):
             bm.edges.layers.float.new("crease_edge")
-        if any(d[3] for d in sticker.edge_data.values()) and not bm.edges.layers.float.get("bevel_weight_edge"):
+        if any(d[3] for d in patch.edge_data.values()) and not bm.edges.layers.float.get("bevel_weight_edge"):
             bm.edges.layers.float.new("bevel_weight_edge")
-        if sticker.vert_crease and not bm.verts.layers.float.get("crease_vert"):
+        if patch.vert_crease and not bm.verts.layers.float.get("crease_vert"):
             bm.verts.layers.float.new("crease_vert")
-        if sticker.uv and uv_source != 'TARGET' and not bm.loops.layers.uv:
-            for name in sticker.uv:
+        if patch.uv and uv_source != 'TARGET' and not bm.loops.layers.uv:
+            for name in patch.uv:
                 bm.loops.layers.uv.new(name)
         mats = bpy.data.objects[self.name].data.materials
         self.mat_index = {}
-        for name in set(sticker.face_material):
+        for name in set(patch.face_material):
             mat = bpy.data.materials.get(name) if name else None
             if mat is None:
                 continue
@@ -868,39 +917,42 @@ class Target:
         self.refresh()
 
     def _world_normal(self, n):
+        """Local normal -> unit world normal."""
         return (self.nmat @ n).normalized()
 
     # -- planning: what would a stamp here do? -------------------------------
 
-    def plan(self, sticker, hover, rot, depth, curve, rigid=False):
+    def plan(self, patch, hover, rot, depth, curve, rigid=False):
         """Describe the stamp at `hover` without touching the mesh.
         -> dict(valid, message, fills, outline, marker, world, + commit data)"""
         face = self.bm.faces[hover[0]]
-        plan = self._plan(sticker, face, hover, rot, depth, curve, rigid)
-        plan["rigid"] = bool(rigid and sticker.rigid)
+        plan = self._plan(patch, face, hover, rot, depth, curve, rigid)
+        plan["rigid"] = bool(rigid and patch.rigid)
         return plan
 
-    def _plan(self, sticker, face, hover, rot, depth, curve, rigid):
-        if sticker.round:
-            # a face with as many corners as the border takes the sticker directly
+    def _plan(self, patch, face, hover, rot, depth, curve, rigid):
+        """Pick the stamping mode for this face: single face (FACE) or A x B block (GRID)."""
+        if patch.round:
+            # a face with as many corners as the border takes the patch directly
             outline = [self.mw @ v.co for v in face.verts]
-            if len(_corner_indices(outline)) == sticker.corner_count:
-                return self._plan_face(sticker, face, rot, depth, curve, rigid)
-        if sticker.grid:
+            if len(_corner_indices(outline)) == patch.corner_count:
+                return self._plan_face(patch, face, rot, depth, curve, rigid)
+        if patch.grid:
             try:
-                return self._plan_grid(sticker, face, hover[1], hover[2], rot, depth, curve,
+                return self._plan_grid(patch, face, hover[1], hover[2], rot, depth, curve,
                                        rigid)
-            except StickerError as ex:
+            except PatchError as ex:
                 outline = [self.mw @ v.co for v in face.verts]
                 return {"valid": False, "message": str(ex),
                         "fills": [outline], "outline": outline}
-        return self._plan_face(sticker, face, rot, depth, curve, rigid)
+        return self._plan_face(patch, face, rot, depth, curve, rigid)
 
-    def _plan_face(self, sticker, face, rot, depth, curve, rigid):
+    def _plan_face(self, patch, face, rot, depth, curve, rigid):
+        """FACE mode: the patch replaces this one face, its corners on the face's corners."""
         verts = list(face.verts)
         outline = [self.mw @ v.co for v in verts]
         corners = _corner_indices(outline)
-        k = sticker.corner_count
+        k = patch.corner_count
         plan = {"valid": False, "message": "", "fills": [outline], "outline": outline}
         if len(corners) != k:
             plan["message"] = "face has %d corners, patch border has %d" % (len(corners), k)
@@ -911,18 +963,20 @@ class Target:
         else:
             normals = [self._world_normal(face.normal)] * k
         plan.update(valid=True, mode='FACE', face=face, verts=verts, corners=corners,
-                    world=sticker.map_points(points, normals, rot, depth, rigid),
+                    world=patch.map_points(points, normals, rot, depth, rigid),
                     marker=[points[rot % k], points[(rot + 1) % k]])
         return plan
 
-    def _plan_grid(self, sticker, face, hu, hv, rot, depth, curve, rigid):
-        a, b = sticker.grid
+    def _plan_grid(self, patch, face, hu, hv, rot, depth, curve, rigid):
+        """GRID mode: walk the quads around `face` to collect the A x B block
+        (centred on the cursor) and its (A+1) x (B+1) vertices."""
+        a, b = patch.grid
         if len(face.loops) != 4:
-            raise StickerError("the patch needs quads only")
+            raise PatchError("the patch needs quads only")
         shift = 0
-        if sticker.round:
+        if patch.round:
             # one step = one border vertex further along the outline of the patch
-            n = len(sticker.round["order"])
+            n = len(patch.round["order"])
             shift, rot = rot % n, (rot // n if a != b else 0)
         rot %= 4
         for _ in range(rot):
@@ -942,7 +996,7 @@ class Target:
             if G[i][j] is None:
                 G[i][j] = v
             elif G[i][j] is not v:
-                raise StickerError("the faces here do not form a regular %d x %d grid" % (a, b))
+                raise PatchError("the faces here do not form a regular %d x %d grid" % (a, b))
 
         faces = []
         cells = [[None] * b for _ in range(a)]     # the 'bottom' loop of every patch face
@@ -963,16 +1017,16 @@ class Target:
                 column = _grid_step(column, '+u')
         flat = [v for col in G for v in col]
         if len(set(flat)) != len(flat) or len(set(faces)) != len(faces):
-            raise StickerError("the mesh is too small for a %d x %d patch" % (a, b))
+            raise PatchError("the mesh is too small for a %d x %d patch" % (a, b))
 
         P = [[self.mw @ v.co for v in col] for col in G]
         N = [[self._world_normal(v.normal) for v in col] for col in G]
         outline = ([P[i][0] for i in range(a)] + [P[a][j] for j in range(b)]
                    + [P[i][b] for i in range(a, 0, -1)] + [P[0][j] for j in range(b, 0, -1)])
-        border = sticker.frame(shift)[0]
+        border = patch.frame(shift)[0]
         marker = []
-        if sticker.round:
-            ij0, ij1 = (border[v] for v in sticker.round["order"][:2])
+        if patch.round:
+            ij0, ij1 = (border[v] for v in patch.round["order"][:2])
             marker = [P[ij0[0]][ij0[1]], P[ij1[0]][ij1[1]]]
         else:
             for i in range(a):
@@ -981,26 +1035,26 @@ class Target:
                 "faces": faces, "G": G, "border": border, "cells": cells, "shift": shift,
                 "fills": [[self.mw @ v.co for v in f.verts] for f in faces],
                 "outline": outline, "marker": marker,
-                "world": sticker.map_grid(P, N, depth, curve, rigid, shift)}
+                "world": patch.map_grid(P, N, depth, curve, rigid, shift)}
 
     # -- committing ----------------------------------------------------------
 
-    def _uv_sampler(self, sticker, plan, rot, uv_layers):
-        """-> function (layer number, sticker face, corner of that face) giving
+    def _uv_sampler(self, patch, plan, rot, uv_layers):
+        """-> function (layer number, patch face, corner of that face) giving
         the UV the replaced faces had at that spot.  Has to be built before
         the faces are removed."""
         if plan["mode"] == 'GRID':
-            a, b = sticker.grid
+            a, b = patch.grid
             cells = plan["cells"]
             data = [[[[lp[layer].uv.copy() for lp in (c, c.link_loop_next,
                                                       c.link_loop_next.link_loop_next,
                                                       c.link_loop_prev)]
                       for c in column] for column in cells] for layer in uv_layers]
-            border, inner, _grid_of = sticker.frame(plan["shift"])
+            border, inner, _grid_of = patch.frame(plan["shift"])
             centres = {}
 
             def sample(li, fi, ci):
-                pts = [border[v] if v in border else inner[v] for v in sticker.faces[fi]]
+                pts = [border[v] if v in border else inner[v] for v in patch.faces[fi]]
                 if fi not in centres:
                     centres[fi] = (sum(q[0] for q in pts) / len(pts), sum(q[1] for q in pts) / len(pts))
                 cu, cv = centres[fi]
@@ -1014,70 +1068,70 @@ class Target:
                 return (q[0] * (1 - fu) + q[1] * fu) * (1 - fv) + (q[3] * (1 - fu) + q[2] * fu) * fv
             return sample
 
-        k = sticker.corner_count
+        k = patch.corner_count
         loops = list(plan["face"].loops)
         data = [[loops[c][layer].uv.copy() for c in plan["corners"]] for layer in uv_layers]
 
         def sample(li, fi, ci):
             uv = Vector((0.0, 0.0))
-            for i, w in enumerate(sticker.weights[sticker.faces[fi][ci]]):
+            for i, w in enumerate(patch.weights[patch.faces[fi][ci]]):
                 if w:
                     uv += data[li][(i + rot) % k] * w
             return uv
         return sample
 
-    def commit(self, sticker, plan, rot, uv_source='AUTO'):
+    def commit(self, patch, plan, rot, uv_source='AUTO'):
         """Apply a valid plan to the mesh. Returns the number of new faces."""
         bm = self.bm
         material, smooth = plan["face"].material_index, plan["face"].smooth
         uv_layers = list(bm.loops.layers.uv.values())
         uv_active = bm.loops.layers.uv.active.name if uv_layers else None
-        sample = self._uv_sampler(sticker, plan, rot, uv_layers) if uv_layers else None
+        sample = self._uv_sampler(patch, plan, rot, uv_layers) if uv_layers else None
         if plan["mode"] == 'GRID':
-            vmap = self._open_grid(sticker, plan)
+            vmap = self._open_grid(patch, plan)
         else:
-            vmap = self._open_face(sticker, plan, rot)
+            vmap = self._open_face(patch, plan, rot)
 
         world = plan["world"]
         layer = bm.verts.layers.deform.verify() if self.group_index is not None else None
         vcrease = bm.verts.layers.float.get("crease_vert")
         count = 0
-        for fi, fverts in enumerate(sticker.faces):
+        for fi, fverts in enumerate(patch.faces):
             fv = []
             for vi in fverts:
                 bv = vmap.get(vi)
                 if bv is None:
                     bv = vmap[vi] = bm.verts.new(self.inv @ world[vi])
-                    if layer is not None and sticker.base:
-                        weight = sticker.base[vi]
+                    if layer is not None and patch.base:
+                        weight = patch.base[vi]
                         if plan.get("rigid"):      # a rigid vertex must not be pulled back
-                            weight *= 1.0 - sticker.rigid_weight.get(vi, 0.0)
+                            weight *= 1.0 - patch.rigid_weight.get(vi, 0.0)
                         if weight > 0.0:
                             bv[layer][self.group_index] = weight
-                    if vcrease is not None and vi in sticker.vert_crease:
-                        bv[vcrease] = sticker.vert_crease[vi]
+                    if vcrease is not None and vi in patch.vert_crease:
+                        bv[vcrease] = patch.vert_crease[vi]
                 fv.append(bv)
             try:
                 nf = bm.faces.new(fv)
             except ValueError:        # face already exists / degenerate
                 continue
-            own = sticker.face_material[fi] in self.mat_index
-            nf.material_index = self.mat_index[sticker.face_material[fi]] if own else material
-            nf.smooth = sticker.face_smooth[fi] if sticker.any_smooth else smooth
-            from_sticker = uv_source == 'STICKER' or (uv_source == 'AUTO' and own)
+            own = patch.face_material[fi] in self.mat_index
+            nf.material_index = self.mat_index[patch.face_material[fi]] if own else material
+            nf.smooth = patch.face_smooth[fi] if patch.any_smooth else smooth
+            from_patch = uv_source == 'PATCH' or (uv_source == 'AUTO' and own)
             for li, uvl in enumerate(uv_layers):
                 src = None
-                if from_sticker:
-                    src = sticker.uv.get(uvl.name)
-                    if src is None and uvl.name == uv_active and sticker.uv_active:
-                        src = sticker.uv[sticker.uv_active]
+                if from_patch:
+                    src = patch.uv.get(uvl.name)
+                    if src is None and uvl.name == uv_active and patch.uv_active:
+                        src = patch.uv[patch.uv_active]
                 for ci, lp in enumerate(nf.loops):
                     lp[uvl].uv = src[fi][ci] if src else sample(li, fi, ci)
             count += 1
 
         crease = bm.edges.layers.float.get("crease_edge")
         bevel = bm.edges.layers.float.get("bevel_weight_edge")
-        for (va, vb), (sharp, seam, cr, bw) in sticker.edge_data.items():
+        for (va, vb), (sharp, seam, cr, bw) in patch.edge_data.items():
             if va not in vmap or vb not in vmap:
                 continue
             e = bm.edges.get((vmap[va], vmap[vb]))
@@ -1096,17 +1150,17 @@ class Target:
         self._write()
         return count
 
-    def _open_grid(self, sticker, plan):
-        """Remove the A x B patch; border vertices of the sticker map onto the
+    def _open_grid(self, patch, plan):
+        """Remove the A x B block; border vertices of the patch map onto the
         existing vertices around the hole."""
         bm = self.bm
-        a, b = sticker.grid
+        a, b = patch.grid
         G = plan["G"]
-        patch = set(plan["faces"])
-        inner_edges = {e for f in patch for e in f.edges
-                       if len(e.link_faces) == 2 and all(lf in patch for lf in e.link_faces)}
+        block = set(plan["faces"])
+        inner_edges = {e for f in block for e in f.edges
+                       if len(e.link_faces) == 2 and all(lf in block for lf in e.link_faces)}
         inner_verts = [G[i][j] for i in range(1, a) for j in range(1, b)]
-        bmesh.ops.delete(bm, geom=list(patch), context='FACES_ONLY')
+        bmesh.ops.delete(bm, geom=list(block), context='FACES_ONLY')
         if inner_edges:
             bmesh.ops.delete(bm, geom=list(inner_edges), context='EDGES')
         inner_verts = [v for v in inner_verts if v.is_valid]   # some die with their edges
@@ -1114,11 +1168,11 @@ class Target:
             bmesh.ops.delete(bm, geom=inner_verts, context='VERTS')
         return {vi: G[i][j] for vi, (i, j) in plan["border"].items()}
 
-    def _open_face(self, sticker, plan, rot):
-        """Remove one face; sticker corners map onto its corners, extra border
+    def _open_face(self, patch, plan, rot):
+        """Remove one face; patch corners map onto its corners, extra border
         vertices split its edges (or reuse vertices already sitting there)."""
         bm = self.bm
-        k = sticker.corner_count
+        k = patch.corner_count
         verts, corners = plan["verts"], plan["corners"]
         bmesh.ops.delete(bm, geom=[plan["face"]], context='FACES_ONLY')
         vmap = {}
@@ -1129,8 +1183,8 @@ class Target:
             c1 = corners[(ti + 1) % k]
             span = (c1 - c0) % n or n
             chain = [verts[(c0 + j) % n] for j in range(span + 1)]
-            vmap[sticker.corner_verts[i]] = chain[0]
-            side = sticker.sides[i]
+            vmap[patch.corner_verts[i]] = chain[0]
+            side = patch.sides[i]
             if not side:
                 continue
             params = [0.0]
@@ -1162,24 +1216,28 @@ class Target:
 # --------------------------------------------------------------------------
 
 class Session:
+    """The tool without its UI: one patch, its targets, the current rotation /
+    depth / curve / rigid state and the undo stack.  The modal operator, the
+    redo (execute) and the tests all work through this class."""
+
     def __init__(self, context, shrinkwrap=False, group="base",
-                 sticker_name=None, target_names=None, rigid=True, rigid_group="rigid",
+                 patch_name=None, target_names=None, rigid=True, rigid_group="rigid",
                  uv_source='AUTO'):
         self.shrinkwrap = shrinkwrap
         self.uv_source = uv_source
         self.group = group
         self.rigid = rigid
         self.rigid_group = rigid_group
-        self.sticker_name = sticker_name or context.view_layer.objects.active.name
+        self.patch_name = patch_name or context.view_layer.objects.active.name
         self.target_names = target_names or [
             o.name for o in context.selected_objects
-            if o.type == 'MESH' and o.name != self.sticker_name]
+            if o.type == 'MESH' and o.name != self.patch_name]
         if not self.target_names:
             self.target_names = [o.name for o in context.visible_objects
-                                 if o.type == 'MESH' and o.name != self.sticker_name
+                                 if o.type == 'MESH' and o.name != self.patch_name
                                  and not o.name.endswith((REF_SUFFIX, OLD_REF_SUFFIX))]
         if not self.target_names:
-            raise StickerError("No target mesh: select the meshes to stamp, then the patch last")
+            raise PatchError("No target mesh: select the meshes to stamp, then the patch last")
         self.rot = 0
         self.depth = 1.0
         self.curve = True
@@ -1188,7 +1246,8 @@ class Session:
         self.message = ""
         self.targets = []
         self._batches = None
-        self.sticker = None
+        self._draw_error_reported = False
+        self.patch = None
         self.undo_stack = []       # target index of every stamp, oldest first
         self.dirty = False         # did this session change the scene at all?
         self.reload()
@@ -1197,7 +1256,7 @@ class Session:
         """(Re)read every mesh from the scene, e.g. after an undo."""
         for t in self.targets:
             t.free()
-        self.sticker = Sticker(bpy.data.objects[self.sticker_name], self.group,
+        self.patch = Patch(bpy.data.objects[self.patch_name], self.group,
                                self.rigid_group)
         self.targets = [Target(bpy.data.objects[n]) for n in self.target_names
                         if n in bpy.data.objects]
@@ -1205,6 +1264,7 @@ class Session:
         self._batches = None
 
     def free(self):
+        """Free every target's bmesh and snapshots."""
         for t in self.targets:
             t.free()
         self.targets = []
@@ -1212,6 +1272,7 @@ class Session:
     # -- state changes -----------------------------------------------------
 
     def set_hover(self, hover):
+        """Change the hovered spot; the preview is rebuilt only when it changes."""
         if hover != self.hover:
             self.hover = hover
             self._batches = None
@@ -1219,6 +1280,7 @@ class Session:
                 self.message = ""
 
     def pick(self, origin, direction):
+        """Ray cast every target; hover the nearest hit (or nothing)."""
         best = None
         for ti, t in enumerate(self.targets):
             hit = t.ray_cast(origin, direction)
@@ -1228,26 +1290,31 @@ class Session:
         self.hover_point = origin + direction.normalized() * best[0] if best else None
 
     def rotate(self, step):
-        self.rot = (self.rot + step) % self.sticker.rot_steps
+        """Rotate by `step` steps (90 deg, or one border vertex for a round patch)."""
+        self.rot = (self.rot + step) % self.patch.rot_steps
         self._batches = None
 
     def scale_depth(self, factor):
+        """Multiply the depth of the patch, kept between 0.01 and 100."""
         self.depth = min(max(self.depth * factor, 0.01), 100.0)
         self._batches = None
 
     def toggle_curve(self):
+        """C in the tool."""
         self.curve = not self.curve
         self._batches = None
 
     def toggle_rigid(self):
+        """R in the tool."""
         self.rigid = not self.rigid
         self._batches = None
 
     def make_plan(self):
+        """Plan of a stamp at the hovered spot with the current settings (None: nothing hovered)."""
         if self.hover is None:
             return None
         ti, hov = self.hover
-        return self.targets[ti].plan(self.sticker, hov, self.rot, self.depth, self.curve,
+        return self.targets[ti].plan(self.patch, hov, self.rot, self.depth, self.curve,
                                      self.rigid)
 
     def apply(self):
@@ -1264,9 +1331,9 @@ class Session:
         self.dirty = True
         if self.shrinkwrap and target.group_index is None:
             target.prepare_shrinkwrap(self.group)
-        target.prepare_data(self.sticker, self.uv_source)
+        target.prepare_data(self.patch, self.uv_source)
         plan = self.make_plan()              # the mesh layers changed: plan again
-        target.commit(self.sticker, plan, self.rot, self.uv_source)
+        target.commit(self.patch, plan, self.rot, self.uv_source)
         self.hover = None
         self._batches = None
         return True
@@ -1278,7 +1345,7 @@ class Session:
         for point, direction, rot, depth, curve, rigid in stamps:
             point = Vector(point)
             direction = Vector(direction).normalized()
-            self.rot = rot % self.sticker.rot_steps
+            self.rot = rot % self.patch.rot_steps
             self.depth, self.curve, self.rigid = depth, curve, rigid
             # look at the recorded spot from just above the surface
             self.pick(point - direction * (1e-4 * max(1.0, point.length)), direction)
@@ -1299,6 +1366,7 @@ class Session:
     # -- drawing -----------------------------------------------------------
 
     def _build_batches(self):
+        """GPU batches of the preview for the current plan."""
         plan = self.make_plan()
         self.message = plan["message"]
         valid = plan["valid"]
@@ -1325,7 +1393,7 @@ class Session:
             (line_shader, batch_for_shader(line_shader, 'LINES', {"pos": loop}), edge, width),
         ]
         if valid:
-            st = self.sticker
+            st = self.patch
             world = plan["world"]
             wires = []
             for a, b in st.edges:
@@ -1335,20 +1403,28 @@ class Session:
             if wires:
                 batches.append((line_shader, batch_for_shader(line_shader, 'LINES', {"pos": wires}),
                                 _pref("wire"), _pref("wire_width")))
-            # orientation marker: first side of the sticker border
+            # orientation marker: first side of the patch border
             batches.append((line_shader,
                             batch_for_shader(line_shader, 'LINES', {"pos": plan["marker"]}),
                             _pref("marker"), width + 2.0))
         return batches
 
     def draw(self):
+        """Viewport draw callback: highlight of the faces to replace, outline,
+        stretched patch edges and the rotation marker."""
         if self.hover is None:
             return
         if self._batches is None:
             try:
                 self._batches = self._build_batches()
-            except Exception:           # never let a draw callback spam errors
+            except Exception:
+                # A draw callback that raises would print on every redraw: draw
+                # nothing instead, but report the first error so it is not lost.
                 self._batches = []
+                if not self._draw_error_reported:
+                    self._draw_error_reported = True
+                    import traceback
+                    traceback.print_exc()
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('NONE')
         viewport = gpu.state.viewport_get()[2:]
@@ -1375,8 +1451,8 @@ _NAV_EVENTS = {
 }
 
 
+# One stamp of a tool run, recorded so that execute() can replay it (redo).
 class TopologyPatchesStamp(bpy.types.PropertyGroup):
-    """One stamp, recorded so that the operator can be redone"""
     point: bpy.props.FloatVectorProperty(size=3)
     direction: bpy.props.FloatVectorProperty(size=3)
     rot: bpy.props.IntProperty()
@@ -1416,6 +1492,7 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
                 and obj is not None and obj.type == 'MESH')
 
     def _new_session(self, context):
+        """A Session with the sidebar options of this scene."""
         opts = context.scene.topology_patches
         return Session(context, opts.use_shrinkwrap, opts.group.strip() or "base",
                        rigid=opts.use_rigid, rigid_group=opts.rigid_group.strip() or "rigid",
@@ -1442,12 +1519,12 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         context.view_layer.update()
         try:
             session = self._new_session(context)
-        except StickerError as ex:
+        except PatchError as ex:
             self.report({'ERROR'}, str(ex))
             return {'CANCELLED'}
         items = [(tuple(st.point), tuple(st.direction), st.rot, st.depth, st.curve, st.rigid)
                  for st in self.stamps]
-        rot = session.sticker.turn_in_place(self.stamps[-1].rot, self.rotation)
+        rot = session.patch.turn_in_place(self.stamps[-1].rot, self.rotation)
         items[-1] = items[-1][:2] + (rot, self.depth, self.curve, self.rigid)
         try:
             done = session.replay(items)
@@ -1463,7 +1540,7 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         self._direction = None
         try:
             self.session = self._new_session(context)
-        except StickerError as ex:
+        except PatchError as ex:
             self.report({'ERROR'}, str(ex))
             return {'CANCELLED'}
         self.area = context.area
@@ -1480,10 +1557,12 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
     # -- helpers -----------------------------------------------------------
 
     def _inside(self, event):
+        """Is the mouse inside the viewport region the tool was started in?"""
         r = self.region
         return (0 <= event.mouse_x - r.x < r.width) and (0 <= event.mouse_y - r.y < r.height)
 
     def _update_hover(self, event):
+        """Ray from the mouse position into the scene."""
         if not self._inside(event):
             self.session.set_hover(None)
             return
@@ -1496,14 +1575,15 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         self.session.pick(origin, direction)
 
     def _update_ui(self, context):
+        """Header text with the keys and the current settings."""
         s = self.session
-        k = len(s.sticker.round["order"]) if s.sticker.round else s.sticker.corner_count
+        k = len(s.patch.round["order"]) if s.patch.round else s.patch.corner_count
         text = ("Topology Patches (%s)  |  LMB: stamp   ←/→: rotate (%d°)   "
                 "↑/↓: depth x%.2f   C: curve %s   R: rigid %s   Ctrl+Z: undo   "
                 "Esc/RMB/Enter: finish"
-                % (s.sticker.label, round(360.0 * (s.rot % k) / k), s.depth,
+                % (s.patch.label, round(360.0 * (s.rot % k) / k), s.depth,
                    "ON" if s.curve else "OFF",
-                   ("ON" if s.rigid else "OFF") if s.sticker.rigid else "(no group)"))
+                   ("ON" if s.rigid else "OFF") if s.patch.rigid else "(no group)"))
         if s.shrinkwrap:
             text += "   [shrinkwrap: %s]" % s.group
         if s.message:
@@ -1512,6 +1592,7 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         self.area.tag_redraw()
 
     def _finish(self, context):
+        """Remove the preview and the header text, free the session."""
         bpy.types.SpaceView3D.draw_handler_remove(self.handle, 'WINDOW')
         context.window.cursor_modal_restore()
         self.area.header_text_set(None)
@@ -1585,6 +1666,7 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
 # UI / registration
 # --------------------------------------------------------------------------
 
+# Sidebar options, stored per scene (scene.topology_patches).
 class TopologyPatchesSettings(bpy.types.PropertyGroup):
     use_shrinkwrap: bpy.props.BoolProperty(
         name="Shrinkwrap to Original",
@@ -1613,17 +1695,19 @@ class TopologyPatchesSettings(bpy.types.PropertyGroup):
         description="Where the UVs of the stamped faces come from",
         items=(('AUTO', "Auto", "Patch faces with their own material keep the patch's "
                                 "UVs, all other faces continue the UVs of the target"),
-               ('STICKER', "Patch", "Always copy the UVs of the patch"),
+               ('PATCH', "Patch", "Always copy the UVs of the patch"),
                ('TARGET', "Target", "Always continue the UVs of the faces that are replaced")),
         default='AUTO')
 
 
 def _color_prop(key, name, description):
+    """RGBA colour property for the preferences, defaulting to DEFAULTS[key]."""
     return bpy.props.FloatVectorProperty(
         name=name, description=description, subtype='COLOR_GAMMA', size=4,
         min=0.0, max=1.0, default=DEFAULTS[key])
 
 
+# Edit > Preferences > Add-ons > Topology Patches: preview colours and widths.
 class TopologyPatchesPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
@@ -1650,6 +1734,7 @@ class TopologyPatchesPreferences(bpy.types.AddonPreferences):
         col.prop(self, "outline_width")
 
 
+# Sidebar (N) > Patches tab, Object Mode.
 class VIEW3D_PT_topology_patches(bpy.types.Panel):
     bl_label = "Topology Patches"
     bl_space_type = 'VIEW_3D'
@@ -1684,6 +1769,7 @@ class VIEW3D_PT_topology_patches(bpy.types.Panel):
 
 
 def _menu(self, context):
+    """Object menu entry."""
     self.layout.separator()
     self.layout.operator(OBJECT_OT_topology_patches.bl_idname, icon='MOD_BOOLEAN')
 
@@ -1694,6 +1780,7 @@ _classes = (TopologyPatchesSettings, TopologyPatchesPreferences, TopologyPatches
 
 
 def register():
+    """Blender calls this when the add-on is enabled."""
     for c in _classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.topology_patches = bpy.props.PointerProperty(type=TopologyPatchesSettings)
@@ -1701,6 +1788,7 @@ def register():
 
 
 def unregister():
+    """Blender calls this when the add-on is disabled."""
     bpy.types.VIEW3D_MT_object.remove(_menu)
     del bpy.types.Scene.topology_patches
     for c in reversed(_classes):

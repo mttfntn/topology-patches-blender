@@ -103,6 +103,55 @@ class TestRegistration(unittest.TestCase):
                              else tuple(tp.DEFAULTS[key]), key)
 
 
+class TestPreview(Case):
+    """The viewport preview (needs the GPU module, which a background Blender
+    only has after gpu.init(); skipped where that fails, e.g. without OpenGL)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import gpu
+        try:
+            gpu.init()
+        except Exception as e:  # no GPU backend on this machine
+            raise unittest.SkipTest(f"gpu.init() failed: {e}")
+
+    def test_batches_for_valid_invalid_and_missing_plans(self):
+        for ob in (fx.frame_patch("F22", 2, 2), fx.round_patch("R8", 8), fx.frame_patch("Huge", 40, 40)):
+            s = self.session(ob)
+            for d in (EQUATOR, fx.direction(0.0, 0.0, 1.0)):
+                self.aim(s, d)
+                batches = s._build_batches()
+                self.assertGreaterEqual(len(batches), 2, ob.name)
+        s.set_hover(None)
+        self.assertIsNone(s.make_plan())
+
+    def test_a_failing_preview_draws_nothing_and_reports_once(self):
+        if not hasattr(fx.new_session(tp, bpy.context, fx.frame_patch("F", 1, 1), [self.target]),
+                       "_draw_error_reported"):
+            self.skipTest("this version does not report preview errors")
+        s = self.session(fx.frame_patch("F22", 2, 2))
+        self.aim(s)
+        calls = []
+
+        def broken():
+            calls.append(1)
+            raise RuntimeError("broken preview")
+        s._build_batches = broken
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(3):
+                s._batches = None
+                try:
+                    s.draw()
+                except SystemError:     # gpu.state needs a viewport: the batches part is what we test
+                    pass
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(s._batches, [])
+        self.assertEqual(err.getvalue().count("RuntimeError: broken preview"), 1)
+
+
 class TestAnalysis(Case):
     def test_labels_and_rotation_steps(self):
         cases = [

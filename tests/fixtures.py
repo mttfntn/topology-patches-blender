@@ -203,6 +203,9 @@ def new_session(tp, context, patch, targets, **kw):
     key = "patch_name" if "patch_name" in params else "sticker_name"
     kw[key] = patch.name
     kw["target_names"] = [t.name for t in targets]
+    # "UVs from the patch" was 'STICKER' before 1.5; the tests use the old name
+    if kw.get("uv_source") == 'STICKER' and hasattr(tp, "Patch"):
+        kw["uv_source"] = 'PATCH'
     return tp.Session(context, **kw)
 
 
