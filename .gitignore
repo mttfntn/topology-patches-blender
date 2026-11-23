@@ -1,3 +1,10 @@
+# Blender scenes and backups stay local
+*.blend
+*.blend1
+*.blend[0-9]*
+# build output
+*.zip
+dist/
+# Python caches
 __pycache__/
 *.pyc
-*.zip

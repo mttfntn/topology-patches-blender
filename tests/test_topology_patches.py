@@ -97,10 +97,17 @@ class TestRegistration(unittest.TestCase):
         props = {p.identifier for p in bpy.ops.object.topology_patches.get_rna_type().properties}
         self.assertTrue({"stamps", "rotation", "depth", "curve", "rigid"} <= props)
 
-    def test_preview_colours_fall_back_to_defaults(self):
+    def test_preview_colours_default_to_DEFAULTS(self):
+        # registered by hand there are no add-on preferences, so DEFAULTS is used;
+        # installed, the preferences start at DEFAULTS (stored as 32-bit floats)
         for key in ("wire", "outline", "fill", "marker", "invalid", "wire_width", "outline_width"):
-            self.assertEqual(tp._pref(key), tp.DEFAULTS[key] if isinstance(tp.DEFAULTS[key], float)
-                             else tuple(tp.DEFAULTS[key]), key)
+            got, want = tp._pref(key), tp.DEFAULTS[key]
+            if isinstance(want, float):
+                self.assertAlmostEqual(got, want, places=6, msg=key)
+            else:
+                self.assertEqual(len(got), len(want), key)
+                for g, w in zip(got, want):
+                    self.assertAlmostEqual(g, w, places=6, msg=key)
 
 
 class TestPreview(Case):
