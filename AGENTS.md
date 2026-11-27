@@ -23,18 +23,18 @@ Run from the repo root:
 
 - **Blender path:** `--blender PATH` or `$BLENDER`. On Windows the default is `C:\Program Files\Blender Foundation\Blender 5.3*\blender.exe`.
 - **Isolation:** `run.py` always uses `--factory-startup` plus a temporary `BLENDER_USER_RESOURCES`. **Never** test against the user's running Blender or profile.
-- **Expected result:** `TOPOLOGY_PATCHES_TESTS ran=24 failures=0 errors=0`.
+- **Expected result:** `TOPOLOGY_PATCHES_TESTS ran=34 failures=0 errors=0`.
 
 ## Architecture (`__init__.py`, top to bottom)
 
-constants + `_pref` → geometry helpers (`_corner_indices`, `_newell`, `_wachspress`, `_mean_value`, `_to_grid`) → **`Patch`** (analysis: `_analyse`, `frame`, `turn_in_place`, `rot_steps`, `map_points`, `map_grid`, rigid islands, `_read_data`) → `_grid_step` → **`Target`** (`ray_cast`, `plan` → `_plan_face`/`_plan_grid`, `commit` → `_open_grid`/`_open_face`, `snapshot`/`restore`, `prepare_shrinkwrap`/`_drop_shrinkwrap`, `prepare_data`) → **`Session`** (`pick`, `make_plan`, `apply`, `undo`, `replay`, preview `_build_batches`/`draw`) → operator `OBJECT_OT_topology_patches` (`invoke`/`modal` = tool; `execute` = redo) → settings, preferences, panel, menu, `register`.
+constants + `_pref` → geometry helpers (`_corner_indices`, `_newell`, `_wachspress`, `_mean_value`, `_to_grid`) → **`Patch`** (analysis: `_analyse`, `frame`, `turn_in_place`, `rot_steps`, `map_points`, `map_grid`, rigid islands, `_read_data`) → `_grid_step` → **`Target`** (`ray_cast`, `plan` → `_plan_face`/`_plan_grid` (→ `_walk_block`, `_grid_plan`), `plan_selection` → `_selection_blocks`, `commit` → `_open_grid`/`_open_face`, `snapshot`/`restore`, `prepare_shrinkwrap`/`_drop_shrinkwrap`, `prepare_data`) → **`Session`** (`pick`, `make_plan`, `apply`, `stamp_selection`, `undo`, `replay`, preview `_build_batches`/`draw`) → operator `OBJECT_OT_topology_patches` (`invoke`/`modal` = tool; `execute` = redo) → `MESH_OT_topology_patches_replace` (Edit Mode: replace the selected faces) → settings, preferences, panel, menu, `register`.
 
 ## Data flow
 
 1. `Session.pick` ray-casts every `Target` (BVH on a bmesh copy) → `hover = (target index, (face, half_u, half_v))`.
 2. `Target.plan` → dict `{valid, message, mode 'GRID'|'FACE', faces, G, border, world, fills, outline, marker, ...}`; `world` = every patch vertex in world space.
 3. `Session.apply` → `snapshot` → `prepare_shrinkwrap?` → `prepare_data` → plan again → `Target.commit` → `_write` (bmesh → mesh).
-4. The operator records each stamp as `(point, direction, rot, depth, curve, rigid)` in `stamps`. `execute` = `view_layer.update()` + new Session + `replay`, the last stamp with `turn_in_place(rot, rotation)` and the panel values.
+4. The operator records each stamp as `(point, direction, rot, depth, curve, rigid, flip)` in `stamps` (`replay` also takes the 6-tuple of older records). `execute` = `view_layer.update()` + new Session + `replay`, the last stamp with `turn_in_place(rot, rotation)` and the panel values.
 5. Scene state lives only in the meshes, the scene's `topology_patches` settings, and the optional shrinkwrap setup (`Patch Shrinkwrap` modifier, `<name>_patch_ref` hidden copy, `base` group).
 
 ## Rules

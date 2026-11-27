@@ -23,14 +23,23 @@ Usage (Object Mode)
    Up / Down arrow ..... depth multiplier
    C ................... curve the patch onto the original surface on/off
    R ................... keep the "rigid" vertex group undistorted on/off
+   F ................... flip the patch along its normal (hole <-> boss)
    Ctrl + Z ............ undo the last stamp (while the tool is running)
    Esc / RMB / Enter ... finish
 
 After the tool is finished, a single Ctrl + Z in Blender takes back every
 stamp made in that run, and the "Adjust Last Operation" panel (bottom left
-of the viewport, or F9) lets you change the rotation, depth, curve and rigid
-setting of the last stamp.  Rotating there never moves the stamp to other
-faces (a patch that is not square turns by half turns).
+of the viewport, or F9) lets you change the rotation, depth, curve, rigid
+and flip setting of the last stamp.  Rotating there never moves the stamp to
+other faces (a patch that is not square turns by half turns).
+
+Usage (Edit Mode)
+-----------------
+Select the faces to replace on the target (one face, or an A x B block of
+quads the size of the patch), Ctrl+click the patch so that it is selected
+(it may stay out of Edit Mode), then run  Face > Replace Selection with Patch.  The redo
+panel has the rotation (every way the patch fits the selection), depth,
+curve, rigid and flip.
 
 The patch
 ---------
@@ -57,7 +66,8 @@ Stretching the patch to fit the block distorts it: a circle turns into an
 oval or an eye shape when the block is not a flat square.  Paint a vertex
 group (default name "rigid") on the PATCH over the vertices that must keep
 their proportions.  Each connected island of that group is placed as one
-piece - moved, rotated and uniformly scaled, never sheared or bent.  Weights
+piece along the surface - moved, rotated and uniformly scaled, never
+sheared - while along the normal it still follows a curved target.  Weights
 between 0 and 1 blend between rigid and stretched, which is how you make a
 smooth transition from the round part to the border.  Border vertices always
 weld to the target and ignore the group.
@@ -381,8 +391,11 @@ class Patch:
     def _apply_rigid(self, out, foot, depth):
         """Blend the rigid islands back to their original proportions.
         `foot(x, y)` is the stretched position of a point of the patch's
-        border plane; around each island's centre it is replaced by its best
-        similarity (move + rotate + uniform scale), so circles stay circles."""
+        border plane.  Along the surface (the island's own x and y) it is
+        replaced by its best similarity (move + rotate + uniform scale), so
+        circles stay circles; along the normal every vertex still follows the
+        surface under it, so the island bends with a curved target instead
+        of standing off it as a flat plate."""
         for isl in self.rigid:
             cx, cy = isl["center"]
             d = isl["delta"]
@@ -401,10 +414,20 @@ class Patch:
             side = n.cross(bis)
             axis_u = (bis - side).normalized()
             axis_v = (bis + side).normalized()
+            # patch coordinates of the foot point that lies under a rigid
+            # position: invert the local stretch [tu tv] (least squares)
+            uu, uv, vv = tu.dot(tu), tu.dot(tv), tv.dot(tv)
+            det = uu * vv - uv * uv
             for vi, w in isl["verts"]:
                 x, y = self.xy[vi]
-                rp = (anchor + (axis_u * (x - cx) + axis_v * (y - cy)) * scale
-                      + n * (self.heights[vi] * scale * depth))
+                t = (axis_u * (x - cx) + axis_v * (y - cy)) * scale
+                lift = 0.0
+                if abs(det) > 1e-20:
+                    a, b = tu.dot(t), tv.dot(t)
+                    fx = cx + (a * vv - b * uv) / det
+                    fy = cy + (b * uu - a * uv) / det
+                    lift = n.dot(foot(fx, fy) - anchor)
+                rp = anchor + t + n * (lift + self.heights[vi] * scale * depth)
                 out[vi] = out[vi].lerp(rp, min(w, 1.0))
 
     def _analyse(self, bm, mw):
@@ -947,6 +970,59 @@ class Target:
                         "fills": [outline], "outline": outline}
         return self._plan_face(patch, face, rot, depth, curve, rigid)
 
+    def plan_selection(self, patch, face_indices, rot, depth, curve, rigid=False):
+        """Describe a stamp that replaces exactly these faces (the Edit Mode
+        operator): one face, or a block of quads the size of the patch grid.
+        `rot` picks one of the orientations the patch fits the block in."""
+        faces = [self.bm.faces[i] for i in face_indices]
+        plan = self._plan_selection(patch, faces, rot, depth, curve, rigid)
+        plan["rigid"] = bool(rigid and patch.rigid)
+        return plan
+
+    def _plan_selection(self, patch, faces, rot, depth, curve, rigid):
+        fills = [[self.mw @ v.co for v in f.verts] for f in faces]
+        invalid = {"valid": False, "fills": fills, "outline": fills[0] if fills else []}
+        if not faces:
+            return dict(invalid, message="no faces selected")
+        if patch.round and len(faces) == 1:
+            if len(_corner_indices(fills[0])) == patch.corner_count:
+                return self._plan_face(patch, faces[0], rot, depth, curve, rigid)
+        if patch.grid:
+            blocks = self._selection_blocks(patch, faces)
+            if blocks:
+                a, b = patch.grid
+                n = len(patch.round["order"]) if patch.round else 1
+                if patch.round and a == b:
+                    # sliding the border around the outline already turns it all the way
+                    block, shift = blocks[0], rot % n
+                else:
+                    block, shift = blocks[(rot // n) % len(blocks)], rot % n if patch.round else 0
+                return self._grid_plan(patch, faces[0], *block, shift, depth, curve, rigid)
+        if len(faces) == 1:
+            return self._plan_face(patch, faces[0], rot, depth, curve, rigid)
+        if patch.grid:
+            return dict(invalid, message="select one face or a %d x %d block of quads"
+                        % patch.grid)
+        return dict(invalid, message="this patch replaces one face: select only one")
+
+    def _selection_blocks(self, patch, faces):
+        """Every way the patch grid covers exactly `faces`: a list of
+        (faces, G, cells), one per orientation, in a fixed order."""
+        a, b = patch.grid
+        wanted = set(faces)
+        if len(wanted) != a * b or any(len(f.loops) != 4 for f in wanted):
+            return []
+        found = []
+        for f in sorted(wanted, key=lambda f: f.index):
+            for lp in f.loops:
+                try:
+                    block = self._walk_block(patch, lp)
+                except PatchError:
+                    continue
+                if set(block[0]) == wanted:
+                    found.append(block)
+        return found
+
     def _plan_face(self, patch, face, rot, depth, curve, rigid):
         """FACE mode: the patch replaces this one face, its corners on the face's corners."""
         verts = list(face.verts)
@@ -989,7 +1065,13 @@ class Target:
             loop = _grid_step(loop, '-u')
         for _ in range(iv):
             loop = _grid_step(loop, '-v')
+        faces, G, cells = self._walk_block(patch, loop)
+        return self._grid_plan(patch, face, faces, G, cells, shift, depth, curve, rigid)
 
+    def _walk_block(self, patch, loop):
+        """-> (faces, G, cells) of the A x B block whose first cell has `loop`
+        as its 'bottom' loop.  Raises PatchError if there is no such block."""
+        a, b = patch.grid
         G = [[None] * (b + 1) for _ in range(a + 1)]
 
         def put(i, j, v):
@@ -1018,7 +1100,11 @@ class Target:
         flat = [v for col in G for v in col]
         if len(set(flat)) != len(flat) or len(set(faces)) != len(faces):
             raise PatchError("the mesh is too small for a %d x %d patch" % (a, b))
+        return faces, G, cells
 
+    def _grid_plan(self, patch, face, faces, G, cells, shift, depth, curve, rigid):
+        """GRID plan for a block found by _walk_block."""
+        a, b = patch.grid
         P = [[self.mw @ v.co for v in col] for col in G]
         N = [[self._world_normal(v.normal) for v in col] for col in G]
         outline = ([P[i][0] for i in range(a)] + [P[a][j] for j in range(b)]
@@ -1080,8 +1166,9 @@ class Target:
             return uv
         return sample
 
-    def commit(self, patch, plan, rot, uv_source='AUTO'):
-        """Apply a valid plan to the mesh. Returns the number of new faces."""
+    def commit(self, patch, plan, rot, uv_source='AUTO', select_new=False):
+        """Apply a valid plan to the mesh. Returns the number of new faces.
+        `select_new`: the new faces become the only selection (Edit Mode)."""
         bm = self.bm
         material, smooth = plan["face"].material_index, plan["face"].smooth
         uv_layers = list(bm.loops.layers.uv.values())
@@ -1091,6 +1178,10 @@ class Target:
             vmap = self._open_grid(patch, plan)
         else:
             vmap = self._open_face(patch, plan, rot)
+        if select_new:
+            for seq in (bm.verts, bm.edges, bm.faces):
+                for elem in seq:
+                    elem.select = False
 
         world = plan["world"]
         layer = bm.verts.layers.deform.verify() if self.group_index is not None else None
@@ -1118,6 +1209,8 @@ class Target:
             own = patch.face_material[fi] in self.mat_index
             nf.material_index = self.mat_index[patch.face_material[fi]] if own else material
             nf.smooth = patch.face_smooth[fi] if patch.any_smooth else smooth
+            if select_new:
+                nf.select_set(True)
             from_patch = uv_source == 'PATCH' or (uv_source == 'AUTO' and own)
             for li, uvl in enumerate(uv_layers):
                 src = None
@@ -1241,6 +1334,8 @@ class Session:
         self.rot = 0
         self.depth = 1.0
         self.curve = True
+        self.flip = False          # mirror the patch along its normal (bump <-> dent)
+        self.selection = None      # (target index, face indices) while stamp_selection runs
         self.hover = None          # (target index, (face index, half_u, half_v))
         self.hover_point = None    # world position under the cursor
         self.message = ""
@@ -1309,12 +1404,24 @@ class Session:
         self.rigid = not self.rigid
         self._batches = None
 
+    def toggle_flip(self):
+        """F in the tool."""
+        self.flip = not self.flip
+        self._batches = None
+
     def make_plan(self):
         """Plan of a stamp at the hovered spot with the current settings (None: nothing hovered)."""
+        # flipping mirrors every height above the border plane; the faces keep
+        # the winding of the target, so their normals stay consistent with it
+        depth = -self.depth if self.flip else self.depth
+        if self.selection is not None:
+            ti, faces = self.selection
+            return self.targets[ti].plan_selection(self.patch, faces, self.rot, depth,
+                                                   self.curve, self.rigid)
         if self.hover is None:
             return None
         ti, hov = self.hover
-        return self.targets[ti].plan(self.patch, hov, self.rot, self.depth, self.curve,
+        return self.targets[ti].plan(self.patch, hov, self.rot, depth, self.curve,
                                      self.rigid)
 
     def apply(self):
@@ -1325,28 +1432,41 @@ class Session:
         self.message = plan["message"]
         if not plan["valid"]:
             return False
-        target = self.targets[self.hover[0]]
+        ti = self.selection[0] if self.selection is not None else self.hover[0]
+        target = self.targets[ti]
         target.snapshot()
-        self.undo_stack.append(self.hover[0])
+        self.undo_stack.append(ti)
         self.dirty = True
         if self.shrinkwrap and target.group_index is None:
             target.prepare_shrinkwrap(self.group)
         target.prepare_data(self.patch, self.uv_source)
         plan = self.make_plan()              # the mesh layers changed: plan again
-        target.commit(self.patch, plan, self.rot, self.uv_source)
+        target.commit(self.patch, plan, self.rot, self.uv_source,
+                      select_new=self.selection is not None)
         self.hover = None
         self._batches = None
         return True
 
+    def stamp_selection(self, target_index, face_indices):
+        """Replace exactly these faces of one target (the Edit Mode operator)
+        with the current settings. Returns True on success."""
+        self.selection = (target_index, list(face_indices))
+        try:
+            return self.apply()
+        finally:
+            self.selection = None
+
     def replay(self, stamps):
         """Stamp again from a record: (point, direction, rot, depth, curve,
-        rigid) for every stamp, in order.  Returns how many succeeded."""
+        rigid[, flip]) for every stamp, in order.  Returns how many succeeded."""
         done = 0
-        for point, direction, rot, depth, curve, rigid in stamps:
+        for stamp in stamps:
+            point, direction, rot, depth, curve, rigid = stamp[:6]
             point = Vector(point)
             direction = Vector(direction).normalized()
             self.rot = rot % self.patch.rot_steps
             self.depth, self.curve, self.rigid = depth, curve, rigid
+            self.flip = bool(stamp[6]) if len(stamp) > 6 else False
             # look at the recorded spot from just above the surface
             self.pick(point - direction * (1e-4 * max(1.0, point.length)), direction)
             done += bool(self.apply())
@@ -1459,6 +1579,7 @@ class TopologyPatchesStamp(bpy.types.PropertyGroup):
     depth: bpy.props.FloatProperty(default=1.0)
     curve: bpy.props.BoolProperty(default=True)
     rigid: bpy.props.BoolProperty(default=True)
+    flip: bpy.props.BoolProperty(default=False)
 
 
 class OBJECT_OT_topology_patches(bpy.types.Operator):
@@ -1483,6 +1604,10 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         name="Keep Rigid Shapes", description="Keep the rigid vertex group of the last stamp "
                                               "undistorted",
         default=True, options={'SKIP_SAVE'})
+    flip: bpy.props.BoolProperty(
+        name="Flip", description="Mirror the last stamp along its normal: a bump becomes a "
+                                 "dent. Its faces keep facing the same way as the target's",
+        default=False, options={'SKIP_SAVE'})
 
     @classmethod
     def poll(cls, context):
@@ -1507,6 +1632,7 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         layout.prop(self, "depth")
         layout.prop(self, "curve")
         layout.prop(self, "rigid")
+        layout.prop(self, "flip")
 
     def execute(self, context):
         """Redo: stamp everything again from the record, the last stamp with
@@ -1522,10 +1648,10 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         except PatchError as ex:
             self.report({'ERROR'}, str(ex))
             return {'CANCELLED'}
-        items = [(tuple(st.point), tuple(st.direction), st.rot, st.depth, st.curve, st.rigid)
-                 for st in self.stamps]
+        items = [(tuple(st.point), tuple(st.direction), st.rot, st.depth, st.curve, st.rigid,
+                  st.flip) for st in self.stamps]
         rot = session.patch.turn_in_place(self.stamps[-1].rot, self.rotation)
-        items[-1] = items[-1][:2] + (rot, self.depth, self.curve, self.rigid)
+        items[-1] = items[-1][:2] + (rot, self.depth, self.curve, self.rigid, self.flip)
         try:
             done = session.replay(items)
         finally:
@@ -1579,11 +1705,12 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         s = self.session
         k = len(s.patch.round["order"]) if s.patch.round else s.patch.corner_count
         text = ("Topology Patches (%s)  |  LMB: stamp   ←/→: rotate (%d°)   "
-                "↑/↓: depth x%.2f   C: curve %s   R: rigid %s   Ctrl+Z: undo   "
+                "↑/↓: depth x%.2f   C: curve %s   R: rigid %s   F: flip %s   Ctrl+Z: undo   "
                 "Esc/RMB/Enter: finish"
                 % (s.patch.label, round(360.0 * (s.rot % k) / k), s.depth,
                    "ON" if s.curve else "OFF",
-                   ("ON" if s.rigid else "OFF") if s.patch.rigid else "(no group)"))
+                   ("ON" if s.rigid else "OFF") if s.patch.rigid else "(no group)",
+                   "ON" if s.flip else "OFF"))
         if s.shrinkwrap:
             text += "   [shrinkwrap: %s]" % s.group
         if s.message:
@@ -1611,7 +1738,7 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
                 if len(self.stamps):
                     last = self.stamps[-1]
                     self.rotation, self.depth = 0, last.depth
-                    self.curve, self.rigid = last.curve, last.rigid
+                    self.curve, self.rigid, self.flip = last.curve, last.rigid, last.flip
                 self._finish(context)
                 # FINISHED registers one undo step for everything stamped in this run
                 return {'FINISHED'} if changed else {'CANCELLED'}
@@ -1633,11 +1760,11 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
             return {'RUNNING_MODAL'}
         elif et == 'LEFTMOUSE':
             point, direction = s.hover_point, self._direction
-            state = (s.rot, s.depth, s.curve, s.rigid)
+            state = (s.rot, s.depth, s.curve, s.rigid, s.flip)
             if s.apply():
                 st = self.stamps.add()
                 st.point, st.direction = point, direction
-                st.rot, st.depth, st.curve, st.rigid = state
+                st.rot, st.depth, st.curve, st.rigid, st.flip = state
                 self._update_hover(event)
         elif et == 'RIGHT_ARROW':
             s.rotate(1)
@@ -1651,6 +1778,8 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
             s.toggle_curve()
         elif et == 'R':
             s.toggle_rigid()
+        elif et == 'F':
+            s.toggle_flip()
         elif et == 'Z' and event.ctrl:
             if s.undo() and len(self.stamps):
                 self.stamps.remove(len(self.stamps) - 1)
@@ -1662,9 +1791,129 @@ class OBJECT_OT_topology_patches(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+class MESH_OT_topology_patches_replace(bpy.types.Operator):
+    """Replace the selected faces with the patch, stretched to fit. In Edit Mode, select faces on the target, then Ctrl+click the patch"""
+    bl_idname = "mesh.topology_patches_replace"
+    bl_label = "Replace Selection with Patch"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    rotation: bpy.props.IntProperty(
+        name="Rotation", description="Turn the patch on the selected faces. A patch that is "
+                                     "not square turns by half turns",
+        soft_min=-16, soft_max=16, default=0)
+    depth: bpy.props.FloatProperty(
+        name="Depth", description="Depth multiplier", min=0.01, max=100.0, default=1.0)
+    curve: bpy.props.BoolProperty(
+        name="Curve", description="Curve the patch onto the original surface", default=True)
+    rigid: bpy.props.BoolProperty(
+        name="Keep Rigid Shapes", description="Keep the rigid vertex group of the patch "
+                                              "undistorted",
+        default=True)
+    flip: bpy.props.BoolProperty(
+        name="Flip", description="Mirror the patch along its normal: a bump becomes a dent. "
+                                 "Its faces keep facing the same way as the target's",
+        default=False)
+
+    @classmethod
+    def poll(cls, context):
+        # what is missing is reported by execute, not hidden behind a greyed-out button
+        return context.mode == 'EDIT_MESH'
+
+    @staticmethod
+    def _roles(context):
+        """-> (patch, targets) or an error message.  The patch is the one
+        selected mesh outside Edit Mode (Ctrl+click in the viewport selects it
+        without editing it), or else the active mesh when other meshes are in
+        Edit Mode with it.  The targets are the meshes in Edit Mode."""
+        vl = context.view_layer
+        active = vl.objects.active
+        in_mode = [o for o in vl.objects if o.type == 'MESH' and o.mode == 'EDIT']
+        outside = [o for o in vl.objects
+                   if o.type == 'MESH' and o.mode != 'EDIT' and o.select_get()]
+        if len(outside) == 1:
+            return outside[0], in_mode
+        if len(outside) > 1:
+            return "More than one patch selected: Ctrl+click only one mesh"
+        if active in in_mode and len(in_mode) > 1:
+            return active, [o for o in in_mode if o is not active]
+        return "No patch: select faces on the target, then Ctrl+click the patch"
+
+    def invoke(self, context, event):
+        self.rigid = context.scene.topology_patches.use_rigid
+        return self.execute(context)
+
+    def execute(self, context):
+        roles = self._roles(context)
+        if isinstance(roles, str):
+            self.report({'ERROR'}, roles)
+            return {'CANCELLED'}
+        patch, targets = roles
+        vl = context.view_layer
+        in_mode = [o for o in vl.objects if o.type == 'MESH' and o.mode == 'EDIT']
+        active = vl.objects.active
+        selected = [o for o in vl.objects if o.select_get()]
+        # the patch and the selection are read from the meshes, which Edit Mode
+        # only writes back when it is left
+        bpy.ops.object.mode_set(mode='OBJECT')
+        failed = []
+        done = 0
+        try:
+            context.view_layer.update()
+            work = []
+            for o in targets:
+                faces = [p.index for p in o.data.polygons if p.select]
+                if faces:
+                    work.append((o.name, faces))
+            if not work:
+                self.report({'ERROR'}, "Select the faces to replace on the target")
+                return {'CANCELLED'}
+            opts = context.scene.topology_patches
+            try:
+                session = Session(context, opts.use_shrinkwrap, opts.group.strip() or "base",
+                                  patch_name=patch.name, target_names=[n for n, _ in work],
+                                  rigid=self.rigid,
+                                  rigid_group=opts.rigid_group.strip() or "rigid",
+                                  uv_source=opts.uv_source)
+            except PatchError as ex:
+                self.report({'ERROR'}, str(ex))
+                return {'CANCELLED'}
+            try:
+                session.rot = self.rotation % session.patch.rot_steps
+                session.depth, session.curve, session.flip = self.depth, self.curve, self.flip
+                for ti, (name, faces) in enumerate(work):
+                    if session.stamp_selection(ti, faces):
+                        done += 1
+                    else:
+                        failed.append("%s: %s" % (name, session.message))
+            finally:
+                session.free()
+        finally:
+            # back to Edit Mode on the same objects, without pulling the patch in
+            for o in vl.objects:
+                o.select_set(o in in_mode)
+            vl.objects.active = active if active in in_mode else in_mode[0]
+            bpy.ops.object.mode_set(mode='EDIT')
+            for o in selected:
+                o.select_set(True)
+        if failed:
+            self.report({'WARNING'} if done else {'ERROR'}, "; ".join(failed))
+        return {'FINISHED'} if done else {'CANCELLED'}
+
+
 # --------------------------------------------------------------------------
 # UI / registration
 # --------------------------------------------------------------------------
+
+def _panel_patch(context):
+    """-> (patch object or None, hint) for the sidebar: the active object in
+    Object Mode; in Edit Mode the patch the Replace operator would use."""
+    if context.mode != 'EDIT_MESH':
+        return context.view_layer.objects.active, "Select targets, then the patch last"
+    roles = MESH_OT_topology_patches_replace._roles(context)
+    if isinstance(roles, str):
+        return None, "Select faces, then Ctrl+click the patch"
+    return roles[0], "Replaces the selected faces of %s" % ", ".join(t.name for t in roles[1])
+
 
 # Sidebar options, stored per scene (scene.topology_patches).
 class TopologyPatchesSettings(bpy.types.PropertyGroup):
@@ -1740,13 +1989,18 @@ class VIEW3D_PT_topology_patches(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Patches"
-    bl_context = "objectmode"
+
+    # Object Mode: the interactive tool; Edit Mode: replace the selected faces
+    @classmethod
+    def poll(cls, context):
+        return context.mode in {'OBJECT', 'EDIT_MESH'}
 
     def draw(self, context):
         col = self.layout.column()
-        obj = context.view_layer.objects.active
+        obj, hint = _panel_patch(context)
+        edit = context.mode == 'EDIT_MESH'
         col.label(text="Patch: %s" % (obj.name if obj else "-"), icon='MESH_GRID')
-        col.label(text="Select targets, then the patch last")
+        col.label(text=hint)
         opts = context.scene.topology_patches
         box = col.box()
         box.prop(opts, "use_shrinkwrap")
@@ -1765,7 +2019,10 @@ class VIEW3D_PT_topology_patches(bpy.types.Panel):
                 and opts.rigid_group not in obj.vertex_groups):
             sub.label(text="Patch has no '%s' group" % opts.rigid_group, icon='INFO')
         col.prop(opts, "uv_source")
-        col.operator(OBJECT_OT_topology_patches.bl_idname, icon='MOD_BOOLEAN')
+        if edit:
+            col.operator(MESH_OT_topology_patches_replace.bl_idname, icon='MOD_BOOLEAN')
+        else:
+            col.operator(OBJECT_OT_topology_patches.bl_idname, icon='MOD_BOOLEAN')
 
 
 def _menu(self, context):
@@ -1774,8 +2031,14 @@ def _menu(self, context):
     self.layout.operator(OBJECT_OT_topology_patches.bl_idname, icon='MOD_BOOLEAN')
 
 
+def _menu_edit(self, context):
+    """Edit Mode Face menu entry."""
+    self.layout.separator()
+    self.layout.operator(MESH_OT_topology_patches_replace.bl_idname, icon='MOD_BOOLEAN')
+
+
 _classes = (TopologyPatchesSettings, TopologyPatchesPreferences, TopologyPatchesStamp,
-            OBJECT_OT_topology_patches,
+            OBJECT_OT_topology_patches, MESH_OT_topology_patches_replace,
             VIEW3D_PT_topology_patches)
 
 
@@ -1785,10 +2048,12 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.Scene.topology_patches = bpy.props.PointerProperty(type=TopologyPatchesSettings)
     bpy.types.VIEW3D_MT_object.append(_menu)
+    bpy.types.VIEW3D_MT_edit_mesh_faces.append(_menu_edit)
 
 
 def unregister():
     """Blender calls this when the add-on is disabled."""
+    bpy.types.VIEW3D_MT_edit_mesh_faces.remove(_menu_edit)
     bpy.types.VIEW3D_MT_object.remove(_menu)
     del bpy.types.Scene.topology_patches
     for c in reversed(_classes):

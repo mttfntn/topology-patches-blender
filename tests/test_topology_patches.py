@@ -309,6 +309,26 @@ class TestRigid(Case):
             else:
                 self.assertGreater(r, 1.02)
 
+    def test_rigid_shape_follows_a_curved_target(self):
+        # rigid keeps the proportions along the surface only: a flat rim at the
+        # border's height must lie on a sphere, not stand off it as a flat plate
+        from mathutils.bvhtree import BVHTree
+        ob = fx.round_patch("R16", 16)
+        n = 16
+        bm = bmesh.new()
+        bm.from_mesh(self.target.data)
+        tree = BVHTree.FromBMesh(bm)
+        try:
+            s = self.session(ob, rigid=True)
+            plan = self.aim(s)
+            self.assertTrue(plan["valid"], plan["message"])
+            rim = [plan["world"][i] for i in range(n, 2 * n)]   # rigid ring at z = 0
+            off = [(p - tree.find_nearest(p)[0]).length for p in rim]
+            self.assertLess(max(off), 0.005)
+            self.assertLess(fx.roundness(rim), 1.01)            # and still round
+        finally:
+            bm.free()
+
 
 class TestShrinkwrap(Case):
     def test_setup_order_groups_and_undo_cleanup(self):
@@ -420,13 +440,15 @@ class TestCarryOver(Case):
 class TestRedo(Case):
     """The Adjust Last Operation panel: execute() replays the recorded stamps."""
 
-    def run_execute(self, patch, stamps, rotation=0, depth=1.0, curve=True, rigid=True):
+    def run_execute(self, patch, stamps, rotation=0, depth=1.0, curve=True, rigid=True, flip=False):
         fx.select(patch, self.target)
         cls = bpy.types.OBJECT_OT_topology_patches
-        recorded = [types.SimpleNamespace(point=Vector(p), direction=Vector(d), rot=r, depth=dp, curve=c, rigid=rg)
+        # `flip` (added in 1.6) is ignored by older versions
+        recorded = [types.SimpleNamespace(point=Vector(p), direction=Vector(d), rot=r, depth=dp, curve=c, rigid=rg,
+                                          flip=False)
                     for p, d, r, dp, c, rg in stamps]
         op = types.SimpleNamespace(stamps=recorded, rotation=rotation, depth=depth, curve=curve, rigid=rigid,
-                                   reports=[])
+                                   flip=flip, reports=[])
         op.report = lambda kind, text: op.reports.append((kind, text))
         op._new_session = lambda context: cls._new_session(op, context)
         return cls.execute(op, bpy.context), op.reports
@@ -497,9 +519,245 @@ class TestRedo(Case):
         self.assertEqual(s.replay(record), 3)
         self.assertEqual(sorted(tuple(round(c, 4) for c in v.co) for v in self.target.data.vertices), live)
 
+    def test_redo_flip(self):
+        ob = fx.frame_patch("F22", 2, 2)
+        stamp, _block = self.record(ob)
+        volume = signed_volume(self.target)
+        res, reports = self.run_execute(ob, [stamp], flip=True)
+        self.assertEqual(res, {'FINISHED'}, reports)
+        self.assertClean(self.target)
+        self.assertGreater(signed_volume(self.target), volume)      # a bump, not a dent
+
     def setUp(self):
         super().setUp()
         self.base_mesh = self.target.data.copy()
+
+
+def signed_volume(ob):
+    """Volume enclosed by the mesh; it shrinks when faces point inwards."""
+    bm = bmesh.new()
+    bm.from_mesh(ob.data)
+    vol = 0.0
+    for f in bm.faces:
+        a = f.verts[0].co
+        for i in range(1, len(f.verts) - 1):
+            vol += a.dot(f.verts[i].co.cross(f.verts[i + 1].co)) / 6.0
+    bm.free()
+    return vol
+
+
+class TestFlip(Case):
+    """F in the tool: the patch is mirrored along its normal, normals stay outwards."""
+
+    def pentagon_prism(self):
+        me = bpy.data.meshes.new("Pent")
+        bm = bmesh.new()
+        bmesh.ops.create_circle(bm, cap_ends=True, segments=5, radius=1.0)
+        ret = bmesh.ops.extrude_face_region(bm, geom=list(bm.faces))
+        bmesh.ops.translate(bm, vec=(0.0, 0.0, 1.0),
+                            verts=[v for v in ret["geom"] if isinstance(v, bmesh.types.BMVert)])
+        bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+        bm.to_mesh(me)
+        bm.free()
+        ob = fx.link("Pent", me, (5.0, 0.0, 0.0))
+        bpy.context.view_layer.update()
+        return ob
+
+    def test_flip_turns_a_dent_into_a_bump(self):
+        start = signed_volume(self.target)
+        cases = [(fx.frame_patch("F22", 2, 2), self.target, EQUATOR),
+                 (fx.round_patch("R8", 8, offset=0.2), self.target, EQUATOR),
+                 (fx.face_patch("P5", 5), self.pentagon_prism(), fx.direction(0.0, 0.0, 1.0))]
+        for ob, target, d in cases:
+            for curve in (True, False):
+                with self.subTest(patch=ob.name, curve=curve):
+                    s = self.session(ob, [target])
+                    s.curve = curve
+                    base = signed_volume(target)
+                    self.stamp(s, d, target)
+                    dent = signed_volume(target)
+                    s.undo()
+                    s.toggle_flip()
+                    self.stamp(s, d, target)
+                    self.assertClean(target)
+                    bump = signed_volume(target)
+                    s.undo()
+                    self.assertLess(dent, base)
+                    self.assertGreater(bump, base)
+                    # mirrored: the bump adds about what the dent took away
+                    self.assertAlmostEqual(bump - base, base - dent, delta=0.5 * (base - dent))
+        self.assertAlmostEqual(signed_volume(self.target), start, places=6)
+
+    def test_replay_records_flip(self):
+        ob = fx.frame_patch("F22", 2, 2)
+        s = self.session(ob)
+        s.flip = True
+        self.aim(s)
+        record = [(tuple(s.hover_point), tuple(-EQUATOR), 0, 1.0, True, True, True)]
+        self.assertTrue(s.apply())
+        live = sorted(tuple(round(c, 4) for c in v.co) for v in self.target.data.vertices)
+        s.undo()
+        s.flip = False
+        self.assertEqual(s.replay(record), 1)
+        self.assertEqual(sorted(tuple(round(c, 4) for c in v.co) for v in self.target.data.vertices), live)
+
+
+class TestReplaceSelection(Case):
+    """Edit Mode: select faces on the target, Ctrl+click the patch, replace the selection."""
+
+    def block(self, patch, d=EQUATOR):
+        """Indices of the faces the tool would replace when aimed along `d`."""
+        s = self.session(patch)
+        plan = self.aim(s, d)
+        self.assertTrue(plan["valid"], plan["message"])
+        return sorted(f.index for f in plan.get("faces", [plan["face"]]))
+
+    def replace(self, patch, faces, patch_in_edit_mode=True, **props):
+        """Select `faces` on the target and run the operator, with the patch
+        in Edit Mode as the active object, or only selected (what Ctrl+click
+        in the viewport does)."""
+        if bpy.context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        me = self.target.data
+        wanted = set(faces)
+        for p in me.polygons:
+            p.select = p.index in wanted
+        verts = {v for i in wanted for v in me.polygons[i].vertices}
+        for v in me.vertices:
+            v.select = v.index in verts
+        for e in me.edges:
+            e.select = all(v in verts for v in e.vertices)
+        if patch_in_edit_mode:
+            fx.select(patch, self.target)
+            bpy.ops.object.mode_set(mode='EDIT')
+        else:
+            fx.select(self.target)
+            bpy.ops.object.mode_set(mode='EDIT')
+            self.target.select_set(False)
+            patch.select_set(True)
+        try:
+            res = bpy.ops.mesh.topology_patches_replace(**props)
+        except RuntimeError:          # the operator reported an error
+            res = {'CANCELLED'}
+        self.assertEqual(bpy.context.mode, 'EDIT_MESH')
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return res
+
+    def reset(self):
+        bm = bmesh.new()
+        bm.from_mesh(self.base_mesh)
+        bm.to_mesh(self.target.data)
+        bm.free()
+
+    def coords(self):
+        return sorted(tuple(round(c, 4) for c in v.co) for v in self.target.data.vertices)
+
+    def setUp(self):
+        super().setUp()
+        self.base_mesh = self.target.data.copy()
+
+    def test_registered_with_redo(self):
+        self.assertEqual(bpy.types.MESH_OT_topology_patches_replace.bl_options, {'REGISTER', 'UNDO'})
+        props = {p.identifier for p in bpy.ops.mesh.topology_patches_replace.get_rna_type().properties}
+        self.assertTrue({"rotation", "depth", "curve", "rigid", "flip"} <= props)
+
+    def test_same_result_as_the_tool_and_new_faces_selected(self):
+        for ob in (fx.frame_patch("F22", 2, 2), fx.frame_patch("F11", 1, 1)):
+            with self.subTest(patch=ob.name):
+                faces = self.block(ob)
+                s = self.session(ob)
+                self.stamp(s)
+                expected = self.coords()
+                s.undo()
+                self.assertEqual(self.replace(ob, faces), {'FINISHED'})
+                self.assertClean(self.target)
+                self.assertEqual(self.coords(), expected)
+                selected = [p for p in self.target.data.polygons if p.select]
+                self.assertEqual(len(selected), len(ob.data.polygons))
+                self.reset()
+
+    def test_single_face_patch_on_one_selected_face(self):
+        ob = fx.face_patch("P4", 4)
+        faces = self.block(ob)
+        self.assertEqual(len(faces), 1)
+        before = len(self.target.data.polygons)
+        self.assertEqual(self.replace(ob, faces), {'FINISHED'})
+        self.assertClean(self.target)
+        self.assertEqual(len(self.target.data.polygons), before - 1 + len(ob.data.polygons))
+
+    def test_every_rotation_replaces_only_the_selection(self):
+        for ob in (fx.round_patch("R8", 8, offset=0.2), fx.frame_patch("F24", 2, 4)):
+            faces = self.block(ob)
+            block_verts = {tuple(round(c, 4) for c in self.target.data.vertices[v].co)
+                           for i in faces for v in self.target.data.polygons[i].vertices}
+            before = set(self.coords())
+            results = set()
+            steps = Patch(ob).rot_steps
+            for rotation in range(steps):
+                with self.subTest(patch=ob.name, rotation=rotation):
+                    self.assertEqual(self.replace(ob, faces, rotation=rotation), {'FINISHED'})
+                    self.assertClean(self.target)
+                    self.assertTrue(before - set(self.coords()) <= block_verts)
+                    results.add(tuple(self.coords()))
+                    self.reset()
+            if ob.name == "R8":       # lopsided: every step lands differently
+                self.assertEqual(len(results), steps)
+
+    def test_flip(self):
+        ob = fx.frame_patch("F22", 2, 2)
+        faces = self.block(ob)
+        base = signed_volume(self.target)
+        self.assertEqual(self.replace(ob, faces), {'FINISHED'})
+        dent = signed_volume(self.target)
+        self.reset()
+        self.assertEqual(self.replace(ob, faces, flip=True), {'FINISHED'})
+        self.assertClean(self.target)
+        self.assertLess(dent, base)
+        self.assertGreater(signed_volume(self.target), base)
+
+    def test_wrong_selection_is_refused_and_changes_nothing(self):
+        f24 = fx.frame_patch("F24", 2, 4)
+        f22 = fx.frame_patch("F22", 2, 2)
+        before = self.coords()
+        for ob, faces in ((f24, self.block(f22)),                  # 2 x 2 block for a 2 x 4 patch
+                          (f22, self.block(f22)[:3]),              # three faces of the block
+                          (f22, [])):                              # nothing selected
+            with self.subTest(patch=ob.name, faces=len(faces)):
+                self.assertEqual(self.replace(ob, faces), {'CANCELLED'})
+                self.assertEqual(self.coords(), before)
+
+    def test_patch_selected_outside_edit_mode(self):
+        # Ctrl+click on another object in Edit Mode only selects it: the
+        # target stays the only (and active) object in Edit Mode
+        ob = fx.frame_patch("F22", 2, 2)
+        faces = self.block(ob)
+        s = self.session(ob)
+        self.stamp(s)
+        expected = self.coords()
+        s.undo()
+        self.assertEqual(self.replace(ob, faces, patch_in_edit_mode=False), {'FINISHED'})
+        self.assertEqual(self.coords(), expected)
+        self.assertEqual(ob.mode, 'OBJECT')
+
+    def test_sidebar_checks_the_groups_of_the_patch_not_the_target(self):
+        ob = fx.round_patch("R8", 8, base=True)
+        fx.select(self.target)
+        bpy.ops.object.mode_set(mode='EDIT')
+        self.target.select_set(False)
+        ob.select_set(True)                 # Ctrl+click: selected, not in Edit Mode
+        patch, _hint = tp._panel_patch(bpy.context)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        self.assertIs(patch, ob)
+        self.assertIn("base", patch.vertex_groups)
+
+    def test_without_a_patch_it_says_so(self):
+        fx.select(self.target)
+        bpy.ops.object.mode_set(mode='EDIT')
+        self.assertTrue(bpy.ops.mesh.topology_patches_replace.poll())
+        with self.assertRaisesRegex(RuntimeError, r"Ctrl\+click the patch"):
+            bpy.ops.mesh.topology_patches_replace()
+        self.assertEqual(bpy.context.mode, 'EDIT_MESH')
+        bpy.ops.object.mode_set(mode='OBJECT')
 
 
 if __name__ == "__main__":

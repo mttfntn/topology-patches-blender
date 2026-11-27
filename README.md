@@ -61,6 +61,8 @@ You can also drag the zip into the Blender window. The package only installs on 
 
 If only the patch is selected, every visible mesh is a target.
 
+**Or, in Edit Mode:** select the faces to replace on the target, **Ctrl-click the patch** to select it, and run **Face › Replace Selection with Patch** (also in the sidebar). See [Replacing selected faces](#replacing-selected-faces-edit-mode).
+
 ---
 
 ## Making a patch
@@ -86,13 +88,22 @@ The block under the cursor must be regular quads. When the patch doesn't fit, th
 | **↑ / ↓** | Depth multiplier |
 | **C** | Curve onto the original surface on/off |
 | **R** | Keep rigid shapes on/off |
+| **F** | Flip the patch along its normal: a hole becomes a boss and back |
 | **Ctrl + Z** | Undo the last stamp while the tool is running |
 | **Esc** / **Right click** / **Enter** | Finish |
 | **Middle mouse**, wheel, numpad | Navigate the view while the tool runs |
 
 **What you see:** the faces to replace in orange (red when the patch doesn't fit), the edges of the stretched patch in blue, and a pink marker on the first side of the patch border, so you can see its rotation.
 
-**After finishing:** one **Ctrl + Z** in Blender takes back every stamp of that run. The **Adjust Last Operation** panel (bottom left of the viewport, or **F9**) changes the **Rotation**, **Depth**, **Curve** and **Keep Rigid Shapes** of the last stamp. Rotating there never moves the stamp to other faces; a block that isn't square turns by half turns.
+**After finishing:** one **Ctrl + Z** in Blender takes back every stamp of that run. The **Adjust Last Operation** panel (bottom left of the viewport, or **F9**) changes the **Rotation**, **Depth**, **Curve**, **Keep Rigid Shapes** and **Flip** of the last stamp. Rotating there never moves the stamp to other faces; a block that isn't square turns by half turns.
+
+### Replacing selected faces (Edit Mode)
+
+1. In Edit Mode on the target, select the faces to replace: **one face**, or a block of quads exactly the size of the patch (**A × B**, either way round; a round patch with N border vertices takes the same block as in the tool).
+2. **Ctrl-click the patch** in the viewport so that it is selected. It doesn't need to be in Edit Mode; if it is (Ctrl-click in the Outliner), it must be the **active** object.
+3. Run **Face › Replace Selection with Patch**, or click it in the sidebar's **Patches** tab.
+
+The selected faces are replaced and the new faces are selected. The **Adjust Last Operation** panel has **Rotation** (steps through every way the patch fits the selection), **Depth**, **Curve**, **Keep Rigid Shapes** and **Flip**. Faces may be selected on several targets at once; each selection is replaced separately. A selection that is not one face or an A × B block of quads is refused with a message. The sidebar options (shrinkwrap, rigid group, UVs) apply as in the tool.
 
 ---
 
@@ -107,7 +118,11 @@ All options are in the sidebar's **Patches** tab and are stored per scene.
 
 ### Keep Rigid Shapes (R)
 
-Stretching a patch to fit distorts it: a circle becomes an oval when the block isn't a flat square. Paint a vertex group named **`rigid`** on the **patch** over the vertices that must keep their proportions. Each connected island of that group is moved, rotated and uniformly scaled as one piece, never sheared or bent. Weights between 0 and 1 blend between rigid and stretched, for a smooth transition. Border vertices always weld to the target and ignore the group.
+Stretching a patch to fit distorts it: a circle becomes an oval when the block isn't a flat square. Paint a vertex group named **`rigid`** on the **patch** over the vertices that must keep their proportions. Each connected island of that group is moved, rotated and uniformly scaled as one piece along the surface, never sheared, so circles stay circles. Along the normal it still follows the target, so on a curved target it bends with the surface instead of standing off it as a flat plate. Weights between 0 and 1 blend between rigid and stretched, for a smooth transition. Border vertices always weld to the target and ignore the group.
+
+### Flip (F)
+
+Mirrors the patch along its normal, so detail modelled below the border (a hole) comes out above the surface (a boss), and the other way round. The new faces keep the winding of the faces around them, so their normals stay consistent with the target; there is nothing to recalculate.
 
 ### Shrinkwrap to Original
 
